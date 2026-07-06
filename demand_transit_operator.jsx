@@ -82,214 +82,6 @@ function verifyNetworkTT(T){
   }
   return {ok:asym===0&&unreachable===0&&viol===0, asym, unreachable, viol, checked:N*N*N};
 }
-/* ---- コリドー軸の構築（需要カバーと路線コストの両立） ----
-   目的：定時定路線（またはセミデマンドの背骨）として引く価値のある1本の軸を、
-   需要（人数重み）・路線延長（実TT）・利用者の乗車時間の3点から決める。
-   手順：
-   1) 端点選定＝接触人数上位の停留所群から「需要×スパン（実TT）」最大の2点。
-   2) 逐次挿入＝「新たにカバーされる人数 ÷ 挿入による延長増（分）」が最大の
-      停留所を安価挿入位置へ追加。ただし挿入後のカバー済みODの平均乗車時間
-      伸び率（路線上所要÷直行TT）が maxStretch を超える挿入は棄却（利便性制約）。
-   3) 停止則＝限界効率が現在の平均効率（人/分）の stopRatio 倍を下回ったら打切り
-      （需要規模に依存しない相対基準）。停留所数上限は全体の6割。
-   4) 2-opt＝経路順序の入替えで総延長を短縮（ジグザグ・後戻りの除去）。
-   カバー＝ODの両端が路線上に載ること（路線は両方向運行の前提で無方向に集計）。 */
-function buildCorridor(records, opts){
-  const {maxStretch=1.6, stopRatio=0.25}=opts||{};
-  const N=STOPS.length;
-  const flow=new Map();                       // "a-b"(a<b) → 人数
-  const touch=Array(N).fill(0);
-  let totalPax=0;
-  for(const r of records||[]){
-    if(!r||r.err||r.o==null||r.d==null||r.o===r.d)continue;
-    if(r.o>=N||r.d>=N)continue;
-    const w=r.pax||1;
-    const key=Math.min(r.o,r.d)+"-"+Math.max(r.o,r.d);
-    flow.set(key,(flow.get(key)||0)+w);
-    touch[r.o]+=w; touch[r.d]+=w; totalPax+=w;
-  }
-  if(totalPax===0)return null;
-  const pathLen=p=>{let s=0;for(let i=0;i+1<p.length;i++)s+=TT[p[i]][p[i+1]];return s;};
-  const evalPath=p=>{                          // カバー人数・平均伸び率（接頭和でO(経路長+流動数)）
-    const pos=new Map(); p.forEach((s,i)=>pos.set(s,i));
-    const pre=[0]; for(let i=0;i+1<p.length;i++)pre.push(pre[i]+TT[p[i]][p[i+1]]);
-    let cov=0,stSum=0;
-    for(const [key,w] of flow){
-      const sp=key.split("-"),a=+sp[0],b=+sp[1];
-      let ia=pos.get(a),ib=pos.get(b);
-      if(ia==null||ib==null)continue;
-      if(ia>ib){const t=ia;ia=ib;ib=t;}
-      cov+=w;
-      const direct=Math.max(Math.min(TT[a][b],TT[b][a]),1);
-      stSum+=w*((pre[ib]-pre[ia])/direct);     // 路線上の乗車時間（順方向の区間和）
-    }
-    return {cov, avgStretch:cov>0?stSum/cov:1};
-  };
-  // 1) 端点：接触上位から需要×スパン最大の2点
-  const ranked=touch.map((c,i)=>[i,c]).filter(e=>e[1]>0).sort((a,b)=>b[1]-a[1]);
-  if(ranked.length<2)return null;
-  const cand=ranked.slice(0,Math.min(ranked.length,12)).map(e=>e[0]);
-  let A=cand[0],B=cand[1],best=-1;
-  for(let i=0;i<cand.length;i++)for(let j=i+1;j<cand.length;j++){
-    const s=Math.sqrt(touch[cand[i]]*touch[cand[j]])*(TT[cand[i]][cand[j]]+TT[cand[j]][cand[i]]);
-    if(s>best){best=s;A=cand[i];B=cand[j];}
-  }
-  let path=[A,B];
-  const inPath=new Set(path);
-  const maxStops=Math.min(N,Math.max(4,Math.ceil(N*0.6)));
-  let curEval=evalPath(path), curLen=pathLen(path);
-  // 2)〜3) 逐次挿入＋相対停止則
-  while(path.length<maxStops){
-    let bestS=-1,bestRatio=0,bestPos=-1;
-    for(let s=0;s<N;s++){
-      if(inPath.has(s)||touch[s]===0)continue;
-      let dMin=Infinity,pos=-1;
-      for(let i=0;i+1<path.length;i++){        // 中間への安価挿入
-        const d=TT[path[i]][s]+TT[s][path[i+1]]-TT[path[i]][path[i+1]];
-        if(d<dMin){dMin=d;pos=i+1;}
-      }
-      const dHead=TT[s][path[0]];              // 端への延長も許す
-      const dTail=TT[path[path.length-1]][s];
-      if(dHead<dMin){dMin=dHead;pos=0;}
-      if(dTail<dMin){dMin=dTail;pos=path.length;}
-      if(!(dMin<Infinity))continue;
-      const p2=path.slice(); p2.splice(pos,0,s);
-      const ev=evalPath(p2);
-      if(ev.avgStretch>maxStretch)continue;    // 利便性制約：伸び率上限
-      const gain=ev.cov-curEval.cov;
-      if(gain<=0)continue;
-      const ratio=gain/Math.max(dMin/60,0.5);  // 人/分（0.5分でクリップ）
-      if(ratio>bestRatio){bestRatio=ratio;bestS=s;bestPos=pos;}
-    }
-    if(bestS<0)break;
-    const avgEff=curLen>0?curEval.cov/(curLen/60):Infinity;
-    if(curLen>0 && bestRatio<stopRatio*avgEff)break;   // 限界効率の相対停止則
-    path.splice(bestPos,0,bestS); inPath.add(bestS);
-    curLen=pathLen(path); curEval=evalPath(path);
-  }
-  // 4) 2-opt：区間反転で総延長を短縮（非対称TTでも全長再計算で正しく比較）。
-  //    延長が縮んでも、カバー済みODの平均伸び率が上限を超える入替えは棄却する
-  //    （距離の最短化が利用者の乗車時間を犠牲にしないための制約付き2-opt）。
-  let improved=true,guard=0;
-  while(improved&&guard++<60){
-    improved=false;
-    for(let i=0;i<path.length-1;i++)for(let k=i+1;k<path.length;k++){
-      const p2=path.slice(0,i).concat(path.slice(i,k+1).reverse(),path.slice(k+1));
-      if(pathLen(p2)<pathLen(path)-1e-9 && evalPath(p2).avgStretch<=maxStretch){
-        path=p2;improved=true;
-      }
-    }
-  }
-  curLen=pathLen(path); curEval=evalPath(path);
-  return {stops:path, lengthSec:curLen, coverage:curEval.cov/totalPax,
-    avgStretch:curEval.avgStretch, covPax:curEval.cov, totalPax};
-}
-/* コリドー停留所列からアンカーにする停留所を間引く。
-   目的：全停留所を時刻の杭にすると各区間が短く（1〜4分）、寄り道の原資が
-   区間ごとに細切れになって実質使えない。杭を主要停留所（約minGap間隔）に
-   限定すれば、区間が長くなり余裕がプールされ、寄り道・待ちの許容が増える。
-   杭でない停留所も経路上にあるため乗降自体は可能（予約で拾う）。
-   始点・終点は常に保持。 */
-function thinCorridorStops(pathStops, minGapSec){
-  if(!minGapSec||pathStops.length<=2)return pathStops.slice();
-  const out=[pathStops[0]];
-  let acc=0;
-  for(let i=1;i<pathStops.length-1;i++){
-    acc+=TT[pathStops[i-1]][pathStops[i]];
-    if(acc>=minGapSec){out.push(pathStops[i]);acc=0;}
-  }
-  out.push(pathStops[pathStops.length-1]);
-  return out;
-}
-/* コリドー軸 → セミデマンド背骨（アンカー列）への変換。
-   アンカー間隔＝直行TT×余裕率（分単位切上げ・最低1分）。余裕率−1が寄り道の原資。
-   opts.mode："oneway"（片道1本）／"roundtrip"（往復＝便ごとに向きを反転）／
-              "loop"（循環＝毎便同方向、便間に終点→始点の回送を挟む）
-   opts.trips：便数（片道1本＝1便と数える。往復1周＝2便）
-   opts.turnaround：便間の折返し・待機秒（既定180秒）
-   opts.endSec：背骨の終了時刻。指定時はtripsを無視し、終了時刻に収まる最大便数を
-                自動算出する（時間帯限定セミ運行用）。1便も入らなければ1便のみ生成。 */
-function corridorToBackbone(pathStops, startSec, slackFactor, opts){
-  const {mode="oneway", trips=1, turnaround=180, endSec=null}=opts||{};
-  const gen=(nTrips)=>{
-    const fwd=pathStops.slice(), rev=pathStops.slice().reverse();
-    const anchors=[];
-    let t=Math.round(startSec/60)*60;
-    for(let k=0;k<nTrips;k++){
-      const seq=(mode==="roundtrip"&&k%2===1)?rev:fwd;
-      for(let i=0;i<seq.length;i++){
-        if(anchors.length===0){ anchors.push({stop:seq[0],time:t}); continue; }
-        const prevStop=anchors[anchors.length-1].stop;
-        let iv;
-        if(i===0){
-          const move=prevStop===seq[0]?0:TT[prevStop][seq[0]]*slackFactor;
-          iv=Math.max(60, Math.ceil((move+turnaround)/60)*60);
-        }else{
-          iv=Math.max(60, Math.ceil(TT[prevStop][seq[i]]*slackFactor/60)*60);
-        }
-        t=anchors[anchors.length-1].time+iv;
-        anchors.push({stop:seq[i],time:t});
-      }
-    }
-    return anchors;
-  };
-  if(mode==="oneway")return gen(1);
-  if(endSec==null)return gen(Math.max(1,trips));
-  // 終了時刻指定：収まる最大便数を探索（1便ずつ増やし、終着が終了時刻を超えたら1つ戻す）
-  let n=1, bb=gen(1);
-  while(true){
-    const next=gen(n+1);
-    if(next[next.length-1].time>endSec)break;
-    n++; bb=next;
-    if(n>=48)break;   // 安全弁
-  }
-  return bb;
-}
-/* セミデマンド有効性の比較試算（アプリの状態は変更しない）。
-   同一の需要行を「全車フル」（構成A）と「指定1台セミ＋残りフル」（構成B）の
-   2構成に、それぞれ空の状態から先着順で流し込み、結果指標を並べて返す。
-   指標：成立数・成立率・平均ズレ（|約束発−希望発|）・拘束時間計（全車spanの和）・
-   平均乗車時間・セミ車の担当件数（構成Bのみ意味を持つ）。 */
-function compareSemiEffect(rows, baseFleet, semiVehId, backbone, P){
-  const runCfg=(fleet, initRoutes)=>{
-    const semiIds=new Set(fleet.filter(v=>v.mode==="semi").map(v=>v.id));
-    const routes={}; for(const v of fleet)routes[v.id]=(initRoutes&&initRoutes[v.id])?[...initRoutes[v.id]]:[];
-    const rm={}; let okc=0, devSum=0, semiCnt=0, paxOk=0, idx=0;
-    for(const q of rows){
-      const drt=TT[q.o][q.d], mrt=mrtFromDRT(drt,P);
-      const dpt=q.mode==="dep"?q.t:q.t-(mrt+P.dwell);
-      const r={id:"X"+(idx++)+"_"+Math.random().toString(36).slice(2,6),num:0,
-        o:q.o,d:q.d,dpt,drt,mrt,sa:q.sa,pax:q.pax,ipt:null,idt:null,vehicle:null};
-      const cs=searchInsertions(routes,rm,r,P,fleet);
-      if(cs.length){
-        const c=cs[0];
-        r.ipt=c.apt;r.idt=c.apt+P.dwell+mrt;r.vehicle=c.vehicle;
-        routes[c.vehicle]=c.route;rm[r.id]=r;okc++;
-        devSum+=Math.abs(c.apt-dpt); paxOk+=(q.pax||1);
-        if(semiIds.has(c.vehicle))semiCnt++;
-      }
-    }
-    let spanSum=0, rideSum=0, rideN=0;
-    for(const v of fleet){
-      const sim=simulate(routes[v.id],rm,P,v);
-      if(!sim.ok)continue;
-      if(sim.events.length)spanSum+=sim.span;
-      const om={},dm={};
-      for(const e of sim.events){if(e.type==="O")om[e.resId]=e;else if(e.type==="D")dm[e.resId]=e;}
-      for(const id in om){const o=om[id],d=dm[id];if(!d)continue;rideSum+=d.adt-o.etd;rideN++;}
-    }
-    return {ok:okc,total:rows.length,rate:rows.length?okc/rows.length:0,
-      devAvg:okc?devSum/okc:0,spanSum,rideAvg:rideN?rideSum/rideN:0,paxOk,semiCnt};
-  };
-  const fullFleet=baseFleet.map(v=>({...v,mode:"full",backbone:[]}));
-  const A=runCfg(fullFleet,null);
-  const semiFleet=baseFleet.map(v=>v.id===semiVehId
-    ?{...v,mode:"semi",backbone}
-    :{...v,mode:"full",backbone:[]});
-  const initRoutes={}; initRoutes[semiVehId]=anchorEvents(backbone);
-  const B=runCfg(semiFleet,initRoutes);
-  return {A,B};
-}
 const _netInit=buildSyntheticNetwork(POS,{mapWidthKm:10,speedKmh:25,kNeighbors:4,coefMin:1.10,coefMax:1.35,seed:42});
 let TT=_netInit.T;
 // 道路ネットワークの隣接区間（マップの薄い参照線＝実際に走行しうる道路区間）
@@ -529,8 +321,6 @@ function searchInsertions(routes, resMap, newRes, P, vehicles){
         r2.splice(j+1,0,{stop:newRes.d,type:"D",resId:newRes.id});
         const sim=simulate(r2,tmpMap,P,v);
         if(!sim.ok) continue;
-        // セミ車：各アンカー区間内で後戻りする挿入は却下（往復・循環の復路は別区間なので通る）
-        if(v.mode==="semi" && v.backbone && v.backbone.length && !bbSegOrdered(r2)) continue;
         const me=sim.events.filter(e=>e.resId===newRes.id);
         const apt=me[0].apt, adt=me[1].adt;
         const added=sim.span-baseSpan;
@@ -709,44 +499,6 @@ function offlineOptimize(rows,P,fleet,tries){
 }
 
 /* ---------------- 初期データ（Excelの要求A/Bを再現） ---------------- */
-// 背骨（{stop,time}の列）→ アンカーイベント列（時刻の杭）。時刻順に整列。
-function anchorEvents(backbone){
-  return [...(backbone||[])].filter(a=>a&&a.stop!=null&&a.time!=null)
-    .sort((a,b)=>a.time-b.time)
-    .map(a=>({type:"ANCHOR",stop:a.stop,atime:a.time}));
-}
-
-// セミ車ルートの区間内秩序チェック。
-// ルートをANCHOR（時刻の杭）で区切り、各区間内で
-//   (1) 区間始点からの所要が単調非減少
-//   (2) 次アンカーへの残所要が単調非増加（＝一歩ごとに次の杭へ近づく）
-// を要求する。(2)が本質的な測度で、区間の進行方向と逆向きの停留所を弾く。
-// 背骨の時間窓の外（最初のアンカー前・最終アンカー以降）は制約なし＝フルデマンドと
-// 同じ自由営業。これにより「ピーク時間帯だけ背骨・それ以外はフル」のハイブリッド運行を
-// 1台で表現できる。最初のアンカーへの定時到達はsimulateの時刻杭が保証するため、
-// 窓前の方向制約は不要（間に合わない挿入は時間面で棄却される）。
-// ※旧版は最終アンカー以降の営業を禁止していた（比較純度のため）が、時間帯限定セミの
-//   要求により撤回。窓外をフルとして使うか遊ばせるかは背骨の敷き方（終了時刻）で制御する。
-// 限界：発と着が別区間に落ちる逆向きODは順序規則では検出されないが、
-// アンカーの時刻杭（区間の持ち時間＝直行TT×余裕率）が大きな逆行寄り道を
-// 時間面で棄却するため、通り得るのは余裕内に収まる小さな寄り道に限られる。
-function bbSegOrdered(route){
-  const anchorIdx=[];
-  route.forEach((e,i)=>{if(e.type==="ANCHOR")anchorIdx.push(i);});
-  if(anchorIdx.length===0)return true;
-  // 各アンカー区間（窓の内側のみ制約）
-  for(let k=0;k+1<anchorIdx.length;k++){
-    const s=route[anchorIdx[k]].stop, e=route[anchorIdx[k+1]].stop;
-    let pf=-Infinity, pr=Infinity;
-    for(let i=anchorIdx[k]+1;i<anchorIdx[k+1];i++){
-      const f=TT[s][route[i].stop], r=TT[route[i].stop][e];
-      if(f<pf-1 || r>pr+1)return false;
-      pf=f; pr=r;
-    }
-  }
-  return true;
-}
-
 function buildInitial(P, vehicles){
   const resMap={}; const routes={1:[],2:[],3:[],4:[],5:[]};
   const seed=[
@@ -795,76 +547,15 @@ export default function App(){
   const [demandViz,setDemandViz]=useState(null);   // 生成/取込した需要（OD放物線用・モーダル再オープン時の復元にも使用）
   const [demandMeta,setDemandMeta]=useState(null);  // 生成設定/取込元（記録用・モーダルをまたいで保持）
   const [showDemand,setShowDemand]=useState(false); // 需要レイヤの表示トグル
-  const [showCorridor,setShowCorridor]=useState(false); // コリドー軸の表示トグル
   const [showMarks,setShowMarks]=useState(true);      // 乗降時刻ラベルの表示トグル（simTime近傍の窓のみ表示）
-  const [corVeh,setCorVeh]=useState(1);              // コリドー→背骨の適用先号車
-  const [corStart,setCorStart]=useState("9:00");     // 背骨の始発時刻（h:mm）
-  const [corEnd,setCorEnd]=useState("");             // 背骨の終了時刻（空＝便数指定。指定時は便数を自動算出＝時間帯限定セミ）
-  const [corSlack,setCorSlack]=useState(140);        // 余裕率（%）：アンカー間隔＝直行TT×余裕率
-  const [corMode,setCorMode]=useState("roundtrip");  // 背骨の方式：片道／往復／循環
-  const [corTrips,setCorTrips]=useState(4);          // 便数（片道1本＝1便）
-  const [corThin,setCorThin]=useState(480);          // アンカー密度：杭の最小間隔秒（0=全停留所）
-  const [corCompare,setCorCompare]=useState(null);   // セミ有効性比較の試算結果
   const [armClear,setArmClear]=useState(false); // 全消去の2クリック確認
   const [netVer,setNetVer]=useState(0);             // ネットワーク再構築時の再描画トリガ
   const [focusVeh,setFocusVeh]=useState(null);       // マップで表示する号車（null=全車）
-  // 車両の運行モード（フル/セミ）と背骨を適用。セミ化時はその号車のルートをアンカー列で初期化し、
-  // その号車の既存予約は一旦外す（背骨は予約前に定義する前提の第一版）。
-  const applyBackbone=(vehId,mode,backbone)=>{
-    let cleared=0;
-    setVehicles(vs=>vs.map(v=>v.id===vehId?{...v,mode,backbone:mode==="semi"?backbone:[]}:v));
-    setState(s=>{
-      const anchors=mode==="semi"?anchorEvents(backbone):[];
-      const resMap={}; for(const id in s.resMap){ if(s.resMap[id].vehicle!==vehId) resMap[id]=s.resMap[id]; else cleared++; }
-      return {...s,resMap,routes:{...s.routes,[vehId]:anchors}};
-    });
-    setCands(null); setTimetable(null); setTtSel(null);
-    return {cleared};
-  };
-  // コリドーパネルの入力（始発・余裕率・方式・便数）から背骨を組み立てる共通処理。
-  // 適用と比較試算の双方から呼ぶ。入力不正・運行時間超過はerrで返す。
-  const buildCorBackbone=()=>{
-    if(!corridorData)return {err:"コリドー軸が未構成。"};
-    const m=String(corStart).match(/^(\d{1,2}):(\d{2})$/);
-    if(!m)return {err:"始発時刻は h:mm 形式で入力（例 9:00）。"};
-    const startSec=(+m[1])*3600+(+m[2])*60;
-    let endSec=null;
-    if(String(corEnd).trim()!==""){
-      const me=String(corEnd).match(/^(\d{1,2}):(\d{2})$/);
-      if(!me)return {err:"終了時刻は h:mm 形式で入力（例 11:00）。空欄なら便数指定になる。"};
-      endSec=(+me[1])*3600+(+me[2])*60;
-      if(endSec<=startSec)return {err:"終了時刻が始発以前になっている。"};
-    }
-    const slack=Math.max(1,corSlack/100);
-    // アンカー間引き：杭を主要停留所（約corThin間隔）に限定し、区間の余裕をプールする。
-    // 全停留所を杭にすると区間が1〜4分に細切れになり、寄り道・待ちの原資が実質使えない。
-    const stops=thinCorridorStops(corridorData.stops,corThin);
-    const bb=corridorToBackbone(stops,startSec,slack,
-      {mode:corMode,trips:corMode==="oneway"?1:corTrips,turnaround:180,endSec});
-    const nTrips=Math.max(1,Math.round(bb.length/stops.length));
-    const last=bb[bb.length-1];
-    const veh=vehicles.find(v=>v.id===corVeh);
-    if(veh&&last.time>veh.end)
-      return {err:`終便の終点アンカー ${fmt(last.time)} が${veh.name}の運行終了 ${fmt(veh.end)} を超える。便数を減らすか、始発を早めるか、余裕率を下げること。`};
-    if(veh&&startSec<veh.start)
-      return {err:`始発 ${fmt(startSec)} が${veh.name}の運行開始 ${fmt(veh.start)} より早い。`};
-    return {bb,startSec,veh,nTrips};
-  };
-  // ルートを白紙化する際、セミ車の背骨アンカーは保持する（予約は消すが運行の骨格は残す）。
-  // これをしないと routes だけ空になり vehicles 側は mode:"semi" のまま残るため、
-  // 背骨のない「見かけフル」状態になって運行分析でセミ車がフルとして集計される。
-  const emptyRoutesKeepingBackbone=()=>{
-    const r={1:[],2:[],3:[],4:[],5:[]};
-    for(const v of vehicles) if(v.mode==="semi"&&v.backbone&&v.backbone.length) r[v.id]=anchorEvents(v.backbone);
-    return r;
-  };
   // 停留所・OD表を読み込んでネットワークを差し替え、状態をリセットする
   const loadNetwork=(stops,odRows,odFactor)=>{
     const info=applyNetwork(stops,odRows,odFactor);
-    // ネットワーク差し替えでは停留所IDの意味が変わりうるため、背骨も含め完全リセットが安全
     setState({resMap:{},routes:{1:[],2:[],3:[],4:[],5:[]},nextNum:1001,lastDemand:null});
-    setVehicles(vs=>vs.map(v=>({...v,mode:"full",backbone:[]})));  // 背骨は停留所前提が崩れるので解除
-    setDemandViz(null); setDemandMeta(null); setShowDemand(false); setShowCorridor(false);
+    setDemandViz(null); setDemandMeta(null); setShowDemand(false);
     setFo(0); setFd(Math.min(1,STOPS.length-1));
     setSimTime(9*3600); setPlaying(false);
     setNetVer(v=>v+1);
@@ -872,8 +563,8 @@ export default function App(){
   };
   // 確定予約・ルート・直近の流し込み記録をすべて白紙に戻す（2クリック確認）
   const clearReservations=()=>{
-    setState(s=>({...s,resMap:{},routes:emptyRoutesKeepingBackbone(),nextNum:1001,lastDemand:null}));
-    setDemandViz(null); setDemandMeta(null); setShowDemand(false); setShowCorridor(false);
+    setState(s=>({...s,resMap:{},routes:{1:[],2:[],3:[],4:[],5:[]},nextNum:1001,lastDemand:null}));
+    setDemandViz(null); setDemandMeta(null); setShowDemand(false);
     setArmClear(false);
   };
   const [speed,setSpeed]=useState(120);          // 実時間1秒＝120秒（2分）
@@ -891,9 +582,6 @@ export default function App(){
   const [state,setState]=useState(()=>buildInitial({sl:{d1:300,d2:1200,s1:480,s2:900},tw:300,dwell:60},DEFAULT_VEHICLES));
   const {resMap,routes,lastDemand}=state;
   const activeVehicles=vehicles.filter(v=>v.active);
-  // コリドー軸：需要から便益÷費用で構築（需要かネットワークが変われば再計算）
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const corridorData=useMemo(()=>demandViz?buildCorridor(demandViz):null,[demandViz,netVer]);
   const mapVehicles=focusVeh?activeVehicles.filter(v=>v.id===focusVeh):activeVehicles;
 
   // 受付フォーム
@@ -1014,8 +702,12 @@ export default function App(){
     <div style={{display:"flex",alignItems:"center",gap:14,padding:"10px 18px",
       background:"#14202F",color:"#E8E4DA"}}>
       <div>
-        <div style={{fontSize:11,letterSpacing:3,color:"#7E8CA0"}}>DRT (DEMAND RESPONSIVE TRANSIT) SIMULATOR</div>
-        <div style={{fontSize:18,fontWeight:700}}>DRTシミュレーター</div>
+        <div style={{fontSize:11,letterSpacing:3,color:"#7E8CA0"}}>DRT SIMULATOR — STABLE / FULL-DEMAND</div>
+        <div style={{fontSize:18,fontWeight:700,display:"flex",alignItems:"center",gap:8}}>
+          DRTシミュレーター
+          <span style={{fontSize:10,fontWeight:600,color:"#8FA0B8",letterSpacing:1,
+            border:"1px solid #38465C",borderRadius:5,padding:"1px 7px"}}>安定版</span>
+        </div>
       </div>
 
       {/* 件数バッジ：流し込み／確定を常時明示 */}
@@ -1250,7 +942,7 @@ export default function App(){
       {/* 右：運行盤 */}
       <div style={{flex:1,display:"flex",flexDirection:"column",minWidth:0}}>
         <div style={{flex:1,minHeight:0,background:"#14202F",position:"relative"}}>
-          <BoardMap vehicles={mapVehicles} routes={routes} resMap={resMap} sims={sims} preview={preview} previewRes={previewResObj} simTime={simTime} demandViz={showDemand?demandViz:null} corridor={showCorridor?corridorData:null} showMarks={showMarks}/>
+          <BoardMap vehicles={mapVehicles} routes={routes} resMap={resMap} sims={sims} preview={preview} previewRes={previewResObj} simTime={simTime} demandViz={showDemand?demandViz:null} showMarks={showMarks}/>
           {/* 需要可視化トグル */}
           <button onClick={()=>setShowDemand(s=>!s)} disabled={!demandViz}
             style={{position:"absolute",left:12,top:10,display:"flex",alignItems:"center",gap:6,
@@ -1261,182 +953,14 @@ export default function App(){
             需要マップ {showDemand?"ON":"OFF"}
             {demandViz&&<span style={{fontWeight:400,fontSize:10.5,opacity:0.85}}>（{demandViz.filter(r=>!r.err&&r.o!==r.d).length}件）</span>}
           </button>
-          {/* コリドー軸トグル：その日の需要が最も乗る走行軸を表示 */}
-          <button onClick={()=>setShowCorridor(s=>!s)} disabled={!demandViz}
-            style={{position:"absolute",left:170,top:10,display:"flex",alignItems:"center",gap:6,
-              background:showCorridor?"rgba(232,162,77,0.92)":"rgba(20,32,47,0.88)",
-              border:`1px solid ${showCorridor?"#E8A24D":"#38465C"}`,borderRadius:9,padding:"7px 12px",
-              cursor:demandViz?"pointer":"not-allowed",opacity:demandViz?1:0.5,
-              color:"#E8E4DA",fontSize:12,fontWeight:700}}>
-            コリドー軸 {showCorridor?"ON":"OFF"}
-          </button>
           {/* 乗降時刻ラベルの表示トグル：既定は再生カーソル±45分の窓のみ表示。OFFで完全非表示 */}
           <button onClick={()=>setShowMarks(s=>!s)}
-            style={{position:"absolute",left:280,top:10,display:"flex",alignItems:"center",gap:6,
+            style={{position:"absolute",left:170,top:10,display:"flex",alignItems:"center",gap:6,
               background:showMarks?"rgba(87,124,168,0.92)":"rgba(20,32,47,0.88)",
               border:`1px solid ${showMarks?"#7C9CC4":"#38465C"}`,borderRadius:9,padding:"7px 12px",
               cursor:"pointer",color:"#E8E4DA",fontSize:12,fontWeight:700}}>
             乗降ラベル {showMarks?"ON":"OFF"}
           </button>
-          {/* コリドー詳細パネル：指標表示＋セミデマンド背骨への適用 */}
-          {showCorridor&&corridorData&&(
-            <div style={{position:"absolute",right:12,top:10,width:252,maxHeight:"calc(100% - 20px)",
-              overflowY:"auto",background:"rgba(20,32,47,0.94)",border:"1px solid #E8A24D",borderRadius:10,
-              padding:"9px 11px",color:"#E8E4DA",fontSize:11}}>
-              <div style={{fontWeight:800,fontSize:12,color:"#E8A24D",marginBottom:5}}>
-                コリドー軸（{corridorData.stops.length}停留所）
-              </div>
-              <div style={{lineHeight:1.7,color:"#C9CFD9"}}>
-                路線延長（片道）：<b style={{color:"#E8E4DA"}}>{(corridorData.lengthSec/60).toFixed(1)}分</b><br/>
-                需要カバー率：<b style={{color:"#E8E4DA"}}>{Math.round(corridorData.coverage*100)}%</b>
-                （{corridorData.covPax}/{corridorData.totalPax}人）<br/>
-                乗車時間の伸び：<b style={{color:"#E8E4DA"}}>平均{corridorData.avgStretch.toFixed(2)}倍</b>（直行比）
-              </div>
-              <div style={{fontSize:10,color:"#9AA7BA",margin:"4px 0 7px"}}>
-                軸に載らない{corridorData.totalPax-corridorData.covPax}人はデマンド車両が受け持つ想定。
-              </div>
-              <div style={{borderTop:"1px solid #38465C",paddingTop:7}}>
-                <div style={{fontWeight:700,marginBottom:4}}>セミデマンド背骨に適用</div>
-                <div style={{display:"flex",gap:5,alignItems:"center",marginBottom:5}}>
-                  <select value={corVeh} onChange={e=>setCorVeh(+e.target.value)}
-                    style={{flex:1,fontSize:11,background:"#1F2D40",color:"#E8E4DA",
-                      border:"1px solid #38465C",borderRadius:5,padding:"3px 4px"}}>
-                    {activeVehicles.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}
-                  </select>
-                  <input value={corStart} onChange={e=>setCorStart(e.target.value)}
-                    style={{width:46,fontSize:11,background:"#1F2D40",color:"#E8E4DA",
-                      border:"1px solid #38465C",borderRadius:5,padding:"3px 4px",textAlign:"center"}}/>
-                  <span style={{color:"#9AA7BA"}}>発</span>
-                </div>
-                {/* 方式（片道・往復・循環）と便数：背骨は「便」の列として敷く */}
-                <div style={{display:"flex",gap:5,alignItems:"center",marginBottom:5}}>
-                  <select value={corMode} onChange={e=>setCorMode(e.target.value)}
-                    style={{flex:1,fontSize:11,background:"#1F2D40",color:"#E8E4DA",
-                      border:"1px solid #38465C",borderRadius:5,padding:"3px 4px"}}>
-                    <option value="roundtrip">往復（便ごとに向き反転）</option>
-                    <option value="loop">循環（毎便同方向）</option>
-                    <option value="oneway">片道1本</option>
-                  </select>
-                  <input type="number" min="1" max="12" value={corTrips} disabled={corMode==="oneway"}
-                    onChange={e=>setCorTrips(Math.max(1,Math.min(12,+e.target.value||1)))}
-                    style={{width:36,fontSize:11,background:"#1F2D40",color:"#E8E4DA",
-                      border:"1px solid #38465C",borderRadius:5,padding:"3px 4px",textAlign:"center",
-                      opacity:corMode==="oneway"?0.4:1}}/>
-                  <span style={{color:"#9AA7BA"}}>便</span>
-                </div>
-                {/* 時間帯限定：終了時刻を入れると便数を自動算出し、時間帯外はフルとして動く */}
-                <div style={{display:"flex",gap:5,alignItems:"center",marginBottom:5}}>
-                  <span style={{color:"#9AA7BA"}}>終了</span>
-                  <input value={corEnd} onChange={e=>setCorEnd(e.target.value)} placeholder="空=便数指定"
-                    style={{width:74,fontSize:11,background:"#1F2D40",color:"#E8E4DA",
-                      border:"1px solid #38465C",borderRadius:5,padding:"3px 4px",textAlign:"center"}}/>
-                  <span style={{color:"#9AA7BA",fontSize:10}}>指定時：時間帯に収まる便数を自動。時間帯外はフル営業</span>
-                </div>
-                <div style={{display:"flex",gap:5,alignItems:"center",marginBottom:5}}>
-                  <span style={{color:"#9AA7BA"}}>杭の間隔</span>
-                  <select value={corThin} onChange={e=>setCorThin(+e.target.value)}
-                    style={{flex:1,fontSize:11,background:"#1F2D40",color:"#E8E4DA",
-                      border:"1px solid #38465C",borderRadius:5,padding:"3px 4px"}}>
-                    <option value={0}>全停留所（時刻表が細かい・寄り道余地小）</option>
-                    <option value={300}>約5分間隔</option>
-                    <option value={480}>約8分間隔（推奨）</option>
-                    <option value={720}>約12分間隔（寄り道余地大）</option>
-                  </select>
-                </div>
-                <div style={{display:"flex",gap:5,alignItems:"center",marginBottom:7}}>
-                  <span style={{color:"#9AA7BA"}}>余裕率</span>
-                  <input type="number" min="100" max="300" step="10" value={corSlack}
-                    onChange={e=>setCorSlack(+e.target.value)}
-                    style={{width:52,fontSize:11,background:"#1F2D40",color:"#E8E4DA",
-                      border:"1px solid #38465C",borderRadius:5,padding:"3px 4px",textAlign:"center"}}/>
-                  <span style={{color:"#9AA7BA"}}>%（寄り道の原資）</span>
-                </div>
-                <button onClick={()=>{
-                    const g=buildCorBackbone();
-                    if(g.err){setMsg({t:"err",m:g.err});return;}
-                    const nb=g.bb.length, last=g.bb[nb-1];
-                    const r=applyBackbone(corVeh,"semi",g.bb);
-                    const modeLabel=(corMode==="roundtrip"?"往復":corMode==="loop"?"循環":"片道")+`${g.nTrips}便`;
-                    setMsg({t:"ok",m:`${g.veh?g.veh.name:""}をセミに設定（${modeLabel}・アンカー${nb}点・${fmt(g.startSec)}発→${fmt(last.time)}終着）。この号車の既存予約${r.cleared}件を外した。動きを見るには「予約一覧の流し込み」から同じ需要を自動確定し直すこと（既定で既存予約をクリアしてから流し込むので二重計上にならない）。`});
-                  }}
-                  style={{width:"100%",fontSize:11.5,fontWeight:700,cursor:"pointer",
-                    background:"#E8A24D",color:"#14202F",border:"none",borderRadius:6,padding:"6px 0"}}>
-                  この軸を背骨として適用
-                </button>
-                {/* 有効性比較：同一需要を「全車フル」と「この号車セミ＋残りフル」に流し込んで並べる（状態は変更しない） */}
-                <button onClick={()=>{
-                    const g=buildCorBackbone();
-                    if(g.err){setMsg({t:"err",m:g.err});return;}
-                    const rows=(demandViz||[]).filter(r=>!r.err&&r.o!==r.d);
-                    if(!rows.length){setMsg({t:"err",m:"比較する需要がない。先に需要を生成すること。"});return;}
-                    const res=compareSemiEffect(rows,activeVehicles,corVeh,g.bb,P);
-                    setCorCompare({...res,vehName:g.veh?g.veh.name:`${corVeh}号車`,n:rows.length,
-                      modeLabel:(corMode==="roundtrip"?"往復":corMode==="loop"?"循環":"片道")+`${g.nTrips}便`+(corEnd?`・${corStart}〜${corEnd}限定`:"")});
-                  }}
-                  style={{width:"100%",fontSize:11.5,fontWeight:700,cursor:"pointer",marginTop:5,
-                    background:"#1F2D40",color:"#E8E4DA",border:"1px solid #E8A24D",borderRadius:6,padding:"6px 0"}}>
-                  有効性を比較（全車フル vs セミ＋フル）
-                </button>
-                {corCompare&&(()=>{
-                  const {A,B}=corCompare;
-                  const dOk=B.ok-A.ok;
-                  const dSpan=B.spanSum-A.spanSum;
-                  const cell={padding:"2px 6px",borderBottom:"1px solid #2A3A50",textAlign:"right",
-                    fontFamily:"'SF Mono','Consolas',monospace"};
-                  const head={...cell,color:"#9AA7BA",fontFamily:"inherit",textAlign:"left"};
-                  let verdict, vColor;
-                  if(dOk>=0&&dSpan<=0){verdict="セミ有効：成立を落とさず拘束時間を削減。";vColor="#7BC96F";}
-                  else if(dOk<0&&dSpan>=0){verdict="セミ不利：成立・拘束時間とも悪化。全車フルが優位。";vColor="#E8718D";}
-                  else if(dOk>0){verdict=`トレードオフ：成立+${dOk}件だが拘束+${Math.round(dSpan/60)}分。成立率優先ならセミ、コスト優先ならフル。`;vColor="#E0A93E";}
-                  else{verdict=`トレードオフ：拘束${Math.round(dSpan/60)}分削減だが成立${dOk}件。コスト優先ならセミ、成立率優先ならフル。`;vColor="#E0A93E";}
-                  return (
-                  <div style={{marginTop:7,borderTop:"1px solid #38465C",paddingTop:6}}>
-                    <div style={{fontWeight:700,marginBottom:3}}>
-                      比較結果（需要{corCompare.n}件・{corCompare.vehName}を{corCompare.modeLabel}のセミに）
-                    </div>
-                    <table style={{width:"100%",fontSize:10.5,borderCollapse:"collapse",color:"#E8E4DA"}}>
-                      <thead><tr>
-                        <th style={head}></th>
-                        <th style={{...cell,color:"#9AA7BA"}}>全車フル</th>
-                        <th style={{...cell,color:"#E8A24D"}}>セミ＋フル</th>
-                      </tr></thead>
-                      <tbody>
-                        <tr><td style={head}>成立</td>
-                          <td style={cell}>{A.ok}/{A.total}</td><td style={cell}>{B.ok}/{B.total}</td></tr>
-                        <tr><td style={head}>成立率</td>
-                          <td style={cell}>{Math.round(A.rate*100)}%</td><td style={cell}>{Math.round(B.rate*100)}%</td></tr>
-                        <tr><td style={head}>拘束時間計</td>
-                          <td style={cell}>{Math.round(A.spanSum/60)}分</td><td style={cell}>{Math.round(B.spanSum/60)}分</td></tr>
-                        <tr><td style={head}>平均ズレ</td>
-                          <td style={cell}>{(A.devAvg/60).toFixed(1)}分</td><td style={cell}>{(B.devAvg/60).toFixed(1)}分</td></tr>
-                        <tr><td style={head}>平均乗車</td>
-                          <td style={cell}>{(A.rideAvg/60).toFixed(1)}分</td><td style={cell}>{(B.rideAvg/60).toFixed(1)}分</td></tr>
-                        <tr><td style={head}>拘束/成立</td>
-                          <td style={cell}>{A.ok?(A.spanSum/60/A.ok).toFixed(1):"—"}分/件</td>
-                          <td style={cell}>{B.ok?(B.spanSum/60/B.ok).toFixed(1):"—"}分/件</td></tr>
-                        <tr><td style={head}>セミ車担当</td>
-                          <td style={cell}>—</td><td style={cell}>{B.semiCnt}件</td></tr>
-                      </tbody>
-                    </table>
-                    <div style={{marginTop:5,fontSize:10.5,color:vColor,lineHeight:1.5}}>{verdict}</div>
-                    <div style={{marginTop:3,fontSize:9.5,color:"#9AA7BA",lineHeight:1.5}}>
-                      ※両構成とも空の状態から先着順で流し込んだ試算。現在の予約状態は変更していない。
-                      計算は需要100件あたり10秒前後。セミ車は背骨の時間帯のみ路線制約を受け、
-                      時間帯の外はフルとして自由に動く。有効性は「成立の減少を最小限に抑えつつ、
-                      拘束/成立（1件を運ぶコスト）をどれだけ下げるか」で読む。予約なし乗車・
-                      時刻表による需要誘発・運行管理の単純さは試算の外。
-                    </div>
-                  </div>);
-                })()}
-              </div>
-            </div>
-          )}
-          {showCorridor&&demandViz&&!corridorData&&(
-            <div style={{position:"absolute",right:12,top:10,background:"rgba(20,32,47,0.94)",
-              border:"1px solid #38465C",borderRadius:10,padding:"8px 11px",color:"#9AA7BA",fontSize:11}}>
-              有効な需要がなくコリドー軸を構成できない。
-            </div>
-          )}
           {/* 号車フィルタ：選んだ号車だけ地図に表示 */}
           <div style={{position:"absolute",left:12,top:52,display:"flex",gap:5,alignItems:"center",
             background:"rgba(20,32,47,0.88)",border:"1px solid #38465C",borderRadius:9,padding:"5px 8px"}}>
@@ -1518,7 +1042,7 @@ export default function App(){
       sims={sims} resMap={resMap} P={P} lastChange={lastChange} initialTab={tableTab} lastDemand={state.lastDemand}/>}
     {showVeh&&<VehicleModal onClose={()=>setShowVeh(false)} vehicles={vehicles} setVehicles={setVehicles}
       sl={sl} setSl={setSl} tw={tw} setTw={setTw} onLoadNetwork={loadNetwork} netVer={netVer}
-      onApplyBackbone={applyBackbone}/>}
+      />}
     {showImport&&<ImportModal onClose={()=>setShowImport(false)} vehicles={vehicles} P={P}
       state={state} setState={setState} setDemandViz={setDemandViz}
       demandViz={demandViz} demandMeta={demandMeta} setDemandMeta={setDemandMeta}
@@ -1580,7 +1104,7 @@ function vehiclePosAt(sim,t){
 const TRAIL_SEC=1800;   // 走行履歴の保持時間（30分で消える）
 const TRAIL_STEP=60;    // 履歴の分割幅（秒）。細かいほど滑らかにフェード
 
-function BoardMap({vehicles,routes,resMap,sims,preview,previewRes,simTime,demandViz,corridor,showMarks}){
+function BoardMap({vehicles,routes,resMap,sims,preview,previewRes,simTime,demandViz,showMarks}){
   // ---- 地図のズーム・パン（viewBox操作） ----
   // ホイール＝カーソル位置を中心に拡縮、ドラッグ＝パン、ボタン＝＋/−/全体。
   // 倍率はviewBox幅900を基準に1〜8倍（最小幅112）。
@@ -1703,25 +1227,6 @@ function BoardMap({vehicles,routes,resMap,sims,preview,previewRes,simTime,demand
         lx:0.25*p0[0]+0.5*cx+0.25*p1[0],ly:0.25*p0[1]+0.5*cy+0.25*p1[1],end:p1});
     }
   }
-  // コリドー軸：buildCorridorで確定済みの順序付き停留所列（prop経由）を描画する。
-  // 経路は中点通過の2次曲線でつなぎ、角を落として実路線らしい滑らかな線にする
-  // （中間停留所の真上は通らないが、停留所は円マーカーで別途示すため位置は読める）。
-  let corridorPath=null, corridorPts=[];
-  if(corridor&&corridor.stops&&corridor.stops.length>=2){
-    corridorPts=corridor.stops;
-    const pts=corridorPts.map(s=>POS[s]);
-    if(pts.length===2){
-      corridorPath=`M ${pts[0][0]} ${pts[0][1]} L ${pts[1][0]} ${pts[1][1]}`;
-    }else{
-      let d=`M ${pts[0][0]} ${pts[0][1]} L ${(pts[0][0]+pts[1][0])/2} ${(pts[0][1]+pts[1][1])/2}`;
-      for(let i=1;i<pts.length-1;i++){
-        const mx=(pts[i][0]+pts[i+1][0])/2, my=(pts[i][1]+pts[i+1][1])/2;
-        d+=` Q ${pts[i][0]} ${pts[i][1]} ${mx} ${my}`;
-      }
-      d+=` L ${pts[pts.length-1][0]} ${pts[pts.length-1][1]}`;
-      corridorPath=d;
-    }
-  }
   // 停留所ごとの乗降マーカー：終日分を常時表示すると密な停留所で重なって読めなくなるため、
   // 再生カーソル（simTime）を中心とした時間窓のみ表示する（運行盤＝今何が起きているかを見る画面という位置づけに合わせる）。
   // 窓内でも同一停留所に複数件が重なる場合があるため、停留所ごとに出現順で縦にスタックし、
@@ -1762,22 +1267,6 @@ function BoardMap({vehicles,routes,resMap,sims,preview,previewRes,simTime,demand
       </marker>
     </defs>
     <rect width="900" height="640" fill="url(#grid)"/>
-
-    {/* コリドー軸：需要カバー×路線コストで構築した走行軸（buildCorridor）。滑らかな曲線＋停留所マーカー */}
-    {corridorPath&&<g>
-      <path d={corridorPath} fill="none" stroke="#E8A24D" strokeWidth="10" strokeLinecap="round"
-        strokeLinejoin="round" opacity="0.42"/>
-      <path d={corridorPath} fill="none" stroke="#E8A24D" strokeWidth="2.5" strokeLinecap="round"
-        strokeLinejoin="round" opacity="0.85" strokeDasharray="1 9"/>
-      {corridorPts.map((s,i)=>(
-        <circle key={"cr"+s} cx={POS[s][0]} cy={POS[s][1]} r={i===0||i===corridorPts.length-1?6:4}
-          fill="#E8A24D" stroke="#3A2A12" strokeWidth="1" opacity="0.9"/>
-      ))}
-      {corridorPts.length>=2&&[corridorPts[0],corridorPts[corridorPts.length-1]].map((s,i)=>(
-        <text key={"crl"+s} x={POS[s][0]} y={POS[s][1]-9} textAnchor="middle" fontSize="10"
-          fill="#F2C079" fontWeight="700">{STOPS[s]}</text>
-      ))}
-    </g>}
 
     {/* 車両ルート */}
     {lines.map(l=>{
@@ -1967,7 +1456,7 @@ function Timeline({vehicles,sims,resMap,P,simTime,preview,previewRes}){
       }
       return (<g key={v.id}>
         <text x={20} y={y-34} fontSize="11" fill="#444" fontWeight="700">
-          {v.name}（定員{v.cap}{v.mode==="semi"?"・セミ":""}）
+          {v.name}（定員{v.cap}）
         </text>
         {/* 運行時間帯（基線） */}
         <line x1={x(v.start)} y1={y} x2={x(v.end)} y2={y} stroke="#E5E1D5" strokeWidth="4" strokeLinecap="round"/>
@@ -1978,20 +1467,6 @@ function Timeline({vehicles,sims,resMap,P,simTime,preview,previewRes}){
           stroke={v.color} strokeWidth="1" strokeDasharray="3 4" opacity="0.55"/>}
         {span>0&&<text x={x(v.start)-4} y={y-v.cap*unit+3} textAnchor="end" fontSize="8"
           fill="#8A8474">定員</text>}
-        {/* セミ車：背骨の運行枠（初便始発〜終便終着）を基線上のバンドで示す。
-            乗車帯・約束・乗降丸はフル車と完全に同一の導出（O/Dイベント由来）であり、
-            セミの違いは「この枠が先に決まっていること」だけ、という構造を表示にも一致させる */}
-        {v.mode==="semi"&&sim.ok&&(()=>{
-          const as=sim.events.filter(e=>e.type==="ANCHOR");
-          if(!as.length)return null;
-          const t0=as[0].apt, t1=as[as.length-1].apt;
-          return (<g>
-            <rect x={x(t0)} y={y-2.5} width={Math.max(x(t1)-x(t0),2)} height={5}
-              rx="2" fill="#577CA8" opacity="0.30"/>
-            <text x={x(t0)-4} y={y+3} textAnchor="end" fontSize="8" fill="#577CA8"
-              fontWeight="700">背骨</text>
-          </g>);
-        })()}
         {/* 空車で動いている区間（回送・待機）は基線上の細線で示す */}
         {segs.map((s,i)=>s.load===0?(
           <line key={i} x1={x(s.t0)} y1={y} x2={x(s.t1)} y2={y}
@@ -2009,11 +1484,8 @@ function Timeline({vehicles,sims,resMap,P,simTime,preview,previewRes}){
             width={Math.max(x(r.t1)-x(r.t0),1.5)} height={Math.max(unit-0.8,1.2)}
             fill="#2E9E8A" opacity="0.92"/>
         ))}
-        {/* 乗降イベント（アンカーは時刻の杭として縦線で表示） */}
-        {sim.ok&&sim.events.map((e,i)=>e.type==="ANCHOR"?(
-          <line key={"e"+i} x1={x(e.apt)} y1={y-6} x2={x(e.apt)} y2={y+6}
-            stroke="#577CA8" strokeWidth="1.5" opacity="0.85"/>
-        ):(
+        {/* 乗降イベント（白丸＝乗車・塗り丸＝降車） */}
+        {sim.ok&&sim.events.map((e,i)=>(
           <circle key={"e"+i} cx={x(e.type==="O"?e.apt:e.adt)} cy={y} r="4"
             fill={e.type==="O"?"#fff":v.color} stroke={v.color} strokeWidth="2"/>
         ))}
@@ -2376,17 +1848,7 @@ function TTMatrix({P}){
 }
 
 /* ---------- 車両設定モーダル（台数・定員・運行時間） ---------- */
-function VehicleModal({onClose,vehicles,setVehicles,sl,setSl,tw,setTw,onLoadNetwork,netVer,onApplyBackbone}){
-  const [bbVeh,setBbVeh]=React.useState(null);        // 背骨編集中の号車id
-  const [bbList,setBbList]=React.useState([]);        // 編集中の背骨 [{stop,time}]
-  const openBackbone=(v)=>{ setBbVeh(v.id);
-    // 過去の編集で文字列時刻が混入していても、ここで秒に正規化してから編集に入る
-    setBbList((v.backbone&&v.backbone.length)
-      ?v.backbone.map(a=>({stop:a.stop,time:typeof a.time==="number"?a.time:hmToSec(a.time,9*3600)}))
-      :[]); };
-  const addAnchor=()=>setBbList(l=>[...l,{stop:0,time:9*3600}]);
-  const setAnchor=(i,k,val)=>setBbList(l=>l.map((a,j)=>j===i?{...a,[k]:val}:a));
-  const rmAnchor=(i)=>setBbList(l=>l.filter((_,j)=>j!==i));
+function VehicleModal({onClose,vehicles,setVehicles,sl,setSl,tw,setTw,onLoadNetwork,netVer}){
   const [netMsg,setNetMsg]=React.useState(null);
   const [stopsFile,setStopsFile]=React.useState(null);
   const [odFile,setOdFile]=React.useState(null);
@@ -2486,67 +1948,6 @@ function VehicleModal({onClose,vehicles,setVehicles,sl,setSl,tw,setTw,onLoadNetw
         <div style={{marginTop:6,fontSize:10.5,color:"#9AA0A8"}}>
           現在：停留所 {STOPS.length}点／OD表 {STOPS.length}×{STOPS.length}。
         </div>
-      </div>
-
-      {/* 運行モード：フルデマンド／セミデマンド（背骨あり） */}
-      <div style={{background:"#fff",border:"1px solid #D8D3C6",borderRadius:10,padding:"12px 14px",marginBottom:14}}>
-        <div style={{fontSize:13,fontWeight:700,marginBottom:2,color:"#3A3526"}}>運行モード（フル／セミデマンド）</div>
-        <div style={{fontSize:11,color:"#6B6453",marginBottom:8,lineHeight:1.6}}>
-          セミは背骨（アンカー＝停留所と時刻）を先に敷く。車両は各アンカー時刻にその停留所へ（早着は待機）、区間の余裕分だけ寄り道して予約を拾う。
-          背骨を適用するとその号車の既存予約は一旦外れる。逆方向や背骨外の需要はフルの号車が拾う。
-        </div>
-        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
-          {vehicles.map(v=>(
-            <div key={v.id} style={{display:"flex",alignItems:"center",gap:6,border:"1px solid #E3DFD3",
-              borderRadius:8,padding:"5px 9px",background:bbVeh===v.id?"#EEF3EF":"#FAF8F2"}}>
-              <Dot c={v.color}/><span style={{fontSize:12,fontWeight:700}}>{v.name}</span>
-              <span style={{fontSize:10.5,color:v.mode==="semi"?"#23694A":"#8A8474"}}>
-                {v.mode==="semi"?`セミ（${(v.backbone||[]).length}点）`:"フル"}
-              </span>
-              <button onClick={()=>openBackbone(v)} style={{fontSize:10.5,border:"1px solid #B9B2A1",
-                background:"#fff",borderRadius:5,padding:"2px 7px",cursor:"pointer"}}>背骨を編集</button>
-            </div>
-          ))}
-        </div>
-        {bbVeh!=null && <div style={{border:"1px solid #C9C4B8",borderRadius:8,padding:"10px",background:"#FAF8F2"}}>
-          <div style={{fontSize:12,fontWeight:700,marginBottom:6}}>
-            {vehicles.find(v=>v.id===bbVeh)?.name} の背骨（{bbList.length}点・上から時刻順・空でフルデマンド）
-          </div>
-          {bbList.length===0 && <div style={{fontSize:11,color:"#8A8474",marginBottom:6}}>アンカーなし＝この号車はフルデマンド。</div>}
-          {/* アンカー一覧：生成背骨（往復×多便）では数十〜百点になるため高さ上限＋スクロール。
-              アンカーのtimeは内部的に秒で持つ。TimeInputはHH:MM文字列を扱うため、この境界で相互変換する
-              （変換なしで秒を渡すと不正値で --:-- になり、編集すると文字列が保存されて時刻計算を壊す）。 */}
-          <div style={{maxHeight:"38vh",overflowY:"auto",paddingRight:4}}>
-          {bbList.map((a,i)=>(
-            <div key={i} style={{display:"flex",gap:6,alignItems:"center",marginBottom:5}}>
-              <span style={{fontSize:11,color:"#8A8474",width:22,textAlign:"right"}}>{i+1}</span>
-              <select value={a.stop} onChange={e=>setAnchor(i,"stop",Number(e.target.value))}
-                style={{padding:"4px 6px",border:"1px solid #C9C4B8",borderRadius:6,fontSize:12,background:"#fff"}}>
-                {STOPS.map((nm,si)=><option key={si} value={si}>{nm}</option>)}
-              </select>
-              <TimeInput value={secToHM(a.time)} onChange={t=>setAnchor(i,"time",hmToSec(t,a.time))}/>
-              <button onClick={()=>rmAnchor(i)} style={{fontSize:11,border:"1px solid #C9A99B",color:"#9B3B2B",
-                background:"#fff",borderRadius:5,padding:"2px 8px",cursor:"pointer"}}>削除</button>
-            </div>
-          ))}
-          </div>
-          <div style={{display:"flex",gap:8,marginTop:8}}>
-            <button onClick={addAnchor} style={{fontSize:11.5,border:"1px solid #1E2A38",background:"#fff",
-              borderRadius:6,padding:"4px 12px",cursor:"pointer"}}>＋アンカー追加</button>
-            <button onClick={()=>{const r=onApplyBackbone(bbVeh,bbList.length?"semi":"full",bbList);
-              const vn=vehicles.find(v=>v.id===bbVeh)?.name||"";
-              setNetMsg({err:false,text:bbList.length
-                ?`${vn}をセミに設定（アンカー${bbList.length}点）。この号車の既存予約${r.cleared}件を外した。動きを見るには「予約一覧の流し込み」で同じ需要を流し直すこと（既定で既存予約クリア済みの状態から確定する）。`
-                :`${vn}をフルに戻した。既存予約${r.cleared}件を外した。`});
-              setBbVeh(null);}}
-              style={{fontSize:11.5,border:"1px solid #23694A",background:"#2E9E6B",color:"#fff",
-                borderRadius:6,padding:"4px 14px",cursor:"pointer",fontWeight:700}}>
-              {bbList.length?"セミとして適用":"フルに戻す"}
-            </button>
-            <button onClick={()=>setBbVeh(null)} style={{fontSize:11.5,border:"1px solid #B9B2A1",
-              background:"#fff",borderRadius:6,padding:"4px 12px",cursor:"pointer"}}>閉じる</button>
-          </div>
-        </div>}
       </div>
 
       <table style={{borderCollapse:"collapse",background:"#fff",border:"1px solid #B9B2A1",width:"100%"}}>
@@ -2690,7 +2091,7 @@ const stamp=()=>{
 
 function ImportModal({onClose,vehicles,P,state,setState,onShowAnalysis,setDemandViz,demandViz,demandMeta,setDemandMeta}){
   const [parsed,setParsed]=React.useState(()=>demandViz||null); // 再オープン時は保持中の需要を復元
-  const [clearFirst,setClearFirst]=React.useState(true); // 流し込み前に既存予約をクリア（背骨・車両設定は維持）。
+  const [clearFirst,setClearFirst]=React.useState(true); // 流し込み前に既存予約をクリア（車両設定は維持）。
                                                           // OFF＝現在の予約に追加（二重計上に注意）
   const [result,setResult]=React.useState(null);
   const [err,setErr]=React.useState(null);
@@ -2827,16 +2228,13 @@ function ImportModal({onClose,vehicles,P,state,setState,onShowAnalysis,setDemand
 
   const run=()=>{
     if(!parsed)return;
-    // クリアON（既定）：予約とルートを白紙にしてから流し込む。ただしセミ車の背骨アンカーは
-    // 再注入する＝運行設定は維持。背骨適用→同じ需要で流し直す、が1操作で正しく行える。
-    // クリアOFF：現在の状態に追加（従来動作）。同じ需要を2回流すと二重計上になる点に注意。
+    // クリアON（既定）：予約とルートを白紙にしてから流し込む。
+    // クリアOFF：現在の状態に追加。同じ需要を2回流すと二重計上になる点に注意。
     let resMap, routes;
     if(clearFirst){
       resMap={};
       routes={};
       for(const k of Object.keys(state.routes)) routes[k]=[];
-      for(const v of vehicles) if(v.mode==="semi"&&v.backbone&&v.backbone.length)
-        routes[v.id]=anchorEvents(v.backbone);
     }else{
       resMap={...state.resMap};
       routes={};
@@ -2976,12 +2374,12 @@ function ImportModal({onClose,vehicles,P,state,setState,onShowAnalysis,setDemand
           <div style={{fontSize:13,margin:"12px 0 8px"}}>
             読込 <b>{parsed.length}件</b>（うち形式エラー {parsed.filter(r=>r.err).length}件）。
             {clearFirst
-              ?<>既存予約 {Object.keys(state.resMap).length}件をクリアしてから流し込む（セミ背骨・車両設定は維持）。</>
+              ?<>既存予約 {Object.keys(state.resMap).length}件をクリアしてから流し込む（車両設定は維持）。</>
               :<>現在の確定予約 {Object.keys(state.resMap).length}件・稼働 {vehicles.filter(v=>v.active).length}台 に<b>追加</b>で流し込む。同じ需要を2回流すと二重計上になる。</>}
           </div>
           <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,margin:"0 0 8px",cursor:"pointer"}}>
             <input type="checkbox" checked={clearFirst} onChange={e=>setClearFirst(e.target.checked)}/>
-            流し込み前に既存予約をクリア（背骨・車両設定・この需要データは維持）
+            流し込み前に既存予約をクリア（車両設定・この需要データは維持）
           </label>
           <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
             <button onClick={run} style={{...btnPrimary,width:"auto",padding:"9px 22px",background:"#2E9E6B"}}>
@@ -3505,325 +2903,8 @@ function analyzeOps(vehicles,sims,resMap,P){
   return {per,total};
 }
 
-/* ---------- 運行方式の適性判定（A＋：需要構造からの3択判定＋粗い反実仮想） ----------
-   DRT／セミデマンド／定時定路線 のどれが向くかを、需要構造の3軸から判定する。
-   軸1 需要密度   ＝ 総需要件数 / 稼働台時（1台1時間で何件の需要があるか）
-   軸2 空間集中度 ＝ HUB絡みシェア と 上位コリドーシェア の高い方（路線が引ける度合い）
-   軸3 時間集中度 ＝ 最大の1時間帯が占める需要シェア（ピークの尖り）
-   判定は 密度×空間集中 の2軸マトリクス＋時間集中の補正。
-   反実仮想：上位コリドーを1本の定時路線とみなし、カバー率・便あたり乗客を概算。
-   路線は需要上位のODから機械的に引く（人が選ばない＝恣意性を殺す）。前提は画面に明示。
-   すべて既存の需要データ・analyzeOps集計から算出。再シミュレーション不要。 */
-function judgeModality(demandRows, vehTotal, params){
-  const rows=demandRows||[];
-  const demandTotal=rows.length;
-  const served=rows.filter(r=>r.ok).length;
-  const failRate=demandTotal>0?(demandTotal-served)/demandTotal:0;
-  const vehHours=params.vehHours||0;
-  const dens=vehHours>0?demandTotal/vehHours:0;              // 件/台時
-
-  const hubSet=new Set(HUBS);
-  let hubTouch=0; const odCount={}, hourB={};
-  for(const r of rows){
-    if(hubSet.has(r.o)||hubSet.has(r.d))hubTouch++;
-    const key=r.o<r.d?`${r.o}-${r.d}`:`${r.d}-${r.o}`;
-    odCount[key]=(odCount[key]||0)+1;
-    const h=Math.floor((r.t||0)/3600); hourB[h]=(hourB[h]||0)+1;
-  }
-  const hubShare=demandTotal>0?hubTouch/demandTotal:0;
-  const odPairs=Object.entries(odCount).sort((a,b)=>b[1]-a[1]);
-  const topShare=demandTotal>0?odPairs.slice(0,3).reduce((s,e)=>s+e[1],0)/demandTotal:0;
-  const spatial=Math.max(hubShare,topShare);                 // 空間集中（拠点集中とコリドー集中の高い方）
-  const hourVals=Object.values(hourB);
-  const peakHourN=hourVals.length?Math.max(...hourVals):0;
-  const temporal=demandTotal>0?peakHourN/demandTotal:0;      // 時間集中（最大1時間帯シェア）
-
-  // 反実仮想：定時路線＝需要接触の多い上位K停留所を1本に連ねた回廊とみなす。
-  // その路線上の停留所どうし（発着の両方が路線上）の需要をカバー可能とする。
-  // K＝路線が停まる停留所数（現実の路線規模パラメータ。機械的に需要上位から採る）。
-  const touch={};
-  for(const r of rows){ touch[r.o]=(touch[r.o]||0)+1; touch[r.d]=(touch[r.d]||0)+1; }
-  const rankedStops=Object.entries(touch).sort((a,b)=>b[1]-a[1]).map(e=>Number(e[0]));
-  const K=Math.max(2,params.lineStopN||Math.ceil((STOPS.length||10)*0.4));
-  let sel=rankedStops.slice(0,K);
-  // 停留所を需要軸（最も離れた2点を結ぶ方向）へ射影し、路線として順序付ける。
-  // 地図のコリドー軸と同じ考え方＝停留所の集合を「1本の路線」として並べる。
-  if(sel.length>=2){
-    let A=sel[0],B=sel[1],best=-1;
-    for(let i=0;i<sel.length;i++)for(let j=i+1;j<sel.length;j++){
-      const d=Math.hypot(POS[sel[i]][0]-POS[sel[j]][0],POS[sel[i]][1]-POS[sel[j]][1]);
-      if(d>best){best=d;A=sel[i];B=sel[j];}
-    }
-    const ax=POS[B][0]-POS[A][0],ay=POS[B][1]-POS[A][1];
-    const proj=s=>(POS[s][0]-POS[A][0])*ax+(POS[s][1]-POS[A][1])*ay;
-    sel=sel.slice().sort((p,q)=>proj(p)-proj(q));
-  }
-  const lineOrder=sel;                       // 路線順（始発→終点）
-  const lineStops=new Set(sel);
-  const posInLine={}; lineOrder.forEach((s,i)=>{posInLine[s]=i;});
-  const dwellSec=params.dwell??60;            // 中間停留所1か所あたりの停車時間
-
-  // 定時路線に乗った場合の乗車時間＝始点から終点まで、路線上の各区間の直行時間（TT）を積算
-  // ＋通過する中間停留所ごとの停車（dwell）。これがDRT直行（TT[o][d]）に対する伸びになる。
-  let covered=0,coveredPax=0,stretchSum=0,stretchN=0;
-  for(const r of rows){
-    if(!(lineStops.has(r.o)&&lineStops.has(r.d)))continue;
-    covered++; coveredPax+=(r.pax||1);
-    const io=posInLine[r.o], id=posInLine[r.d];
-    const lo=Math.min(io,id), hi=Math.max(io,id);
-    let rideT=0;
-    for(let i=lo;i<hi;i++) rideT+=TT[lineOrder[i]][lineOrder[i+1]];
-    rideT += Math.max(0,hi-lo-1)*dwellSec;    // 通過する中間停留所の停車時間
-    const direct=Math.max(1,TT[r.o][r.d]);
-    stretchSum += rideT/direct; stretchN++;
-  }
-  const coverRate=demandTotal>0?covered/demandTotal:0;
-  const fixedStretch=stretchN>0?stretchSum/stretchN:1;   // 定時路線に乗った場合の平均乗車時間の伸び倍率
-  const opHours=params.opHours||8;
-  const trips=params.headwayMin>0?Math.floor(opHours*60/params.headwayMin):0;  // 片方向便数
-  const paxPerTrip=trips>0?coveredPax/(trips*2):0;           // 往復=trips×2便で割る
-  const waitAvgMin=(params.headwayMin||0)/2;                 // 平均待ち時間（ランダム到着想定）
-  const waitMaxMin=params.headwayMin||0;                     // 最大待ち時間（発車直後に来た場合）
-  // 路線名は主要停留所（HUB優先→需要上位）を数個だけ表示
-  const hubOnLine=[...lineStops].filter(i=>hubSet.has(i));
-  const labelStops=(hubOnLine.length?hubOnLine:rankedStops.slice(0,3)).slice(0,4);
-  const corridorNames=labelStops.map(i=>STOPS[i]).join("・")+(lineStops.size>labelStops.length?` ほか計${lineStops.size}停留所`:"");
-
-  // 個別比較：確定予約（実績あり）のうち、この路線でカバーされる人だけを対象に
-  // DRT実績（乗車時間・希望とのズレ）と定時試算（乗車時間・待ち時間）を1対1で比べる。
-  // 母集団は「不成立込みの全需要」ではなく「実際に運んだ確定予約」に限定する
-  // （不成立分は実績が存在しないため比較できない）。
-  const drtDetail=params.drtDetail||[];
-  const onLine=drtDetail.filter(r=>lineStops.has(r.o)&&lineStops.has(r.d));
-  let compare=null;
-  if(onLine.length>0){
-    const n=onLine.length, paxN=onLine.reduce((s,r)=>s+r.pax,0);
-    const drtRideAvg=onLine.reduce((s,r)=>s+r.ride,0)/n;
-    const drtDevAvg=onLine.reduce((s,r)=>s+r.devAbs,0)/n;
-    let fxSum=0;
-    for(const r of onLine){
-      const io=posInLine[r.o], id=posInLine[r.d];
-      const lo=Math.min(io,id), hi=Math.max(io,id);
-      let rideT=0; for(let i=lo;i<hi;i++) rideT+=TT[lineOrder[i]][lineOrder[i+1]];
-      rideT += Math.max(0,hi-lo-1)*dwellSec;
-      fxSum+=rideT;
-    }
-    const fxRideAvg=fxSum/n;
-    compare={n,paxN,drtTotalN:drtDetail.length,
-      drtRideAvgMin:drtRideAvg/60, fxRideAvgMin:fxRideAvg/60,
-      drtDevAvgMin:drtDevAvg/60, fxWaitAvgMin:(params.headwayMin||0)/2, fxWaitMaxMin:params.headwayMin||0};
-  }
-  // 走行距離：DRTは現運用の総走行距離（全予約分・回送含む）。定時は候補路線を往復×便数、
-  // 需要の有無に関わらず走る固定距離。母集団も性質も異なる「システム全体のコスト」比較として示す。
-  const lineKm=(()=>{ let s=0; for(let i=0;i<lineOrder.length-1;i++) s+=TT[lineOrder[i]][lineOrder[i+1]]; return s/3600*SPEED_KMH; })();
-  const fixedDailyKm=lineKm*2*trips;
-  const drtDailyKm=(vehTotal||{}).distKm||0;
-
-  // 現DRT実績（対比の左側）
-  const t=vehTotal||{};
-  const drtPaxPerVehHour=vehHours>0?served/vehHours:0;
-  const drtLoadRate=t.span>0?t.loadedTime/t.span:0;
-  const drtShareRate=t.loadedTime>0?t.sharedTime/t.loadedTime:0;
-
-  // 判定マトリクス（閾値は仮置き＝現場キャリブレーション前提）
-  const HI_D=3.0, HI_S=0.5, HI_T=0.30;
-  const dHi=dens>=HI_D, sHi=spatial>=HI_S, tHi=temporal>=HI_T;
-  const p=x=>Math.round(x*100);
-  let v;
-  if(dHi&&sHi){
-    v={key:"fixed",label:"定時定路線／コミュニティバス",
-      reason:`需要密度が高く（${dens.toFixed(1)}件/台時）、${p(spatial)}%が特定コリドー・拠点に集中している。決まった路線に需要が乗るため、定時便の方が1便あたり乗客を確保でき、DRTの相乗り調整コストが不要。`,
-      action:"主要コリドーに定時路線を敷き、DRTは路線を補完する端末アクセス（ラストマイル）に限定する構成が有力。"};
-  }else if(dHi&&!sHi){
-    v={key:"full",label:"フルデマンドDRT（飽和に注意）",
-      reason:`需要密度は高い（${dens.toFixed(1)}件/台時）が、起終点が多方向に散っている（コリドー集中${p(spatial)}%）。路線を引いても取りこぼしが多く、多対多を捌けるDRTが向く。`,
-      action:failRate>=0.15?`ただし不成立が${p(failRate)}%と高く飽和気味。ゾーン分割（エリアを割って車両専属化）か増車・増定員を検討。`:"現状の多対多需要はDRTが適合。密度が上がり続けるならゾーン分割を視野に。"};
-  }else if(!dHi&&sHi){
-    v={key:"semi",label:"セミデマンド（背骨型）",
-      reason:`需要は薄い（${dens.toFixed(1)}件/台時）が、${p(spatial)}%がコリドー・拠点に集中している。背骨（定時ルート）を1本通し、端をデマンドで拾う中間形態が効率的。`,
-      action:"上位コリドーを背骨に設定し、外れる需要のみデマンド逸脱で拾う。実装済みのセミデマンド運行が適合する。"};
-  }else{
-    v={key:"full",label:"フルデマンドDRT",
-      reason:`需要が薄く（${dens.toFixed(1)}件/台時）、起終点も散っている（コリドー集中${p(spatial)}%）。定時便は空気を運ぶことになり、必要な時だけ動くDRTが適合。`,
-      action:"フルデマンドが妥当。さらに薄いなら個別運行（タクシー的）や需要喚起（受付時間帯の集約）も選択肢。"};
-  }
-  if(tHi&&(v.key==="full"||v.key==="semi"))
-    v.tempNote=`時間帯の集中が高い（ピーク1時間に${p(temporal)}%）。ピーク帯だけ定時便を増発する併用も検討余地。`;
-
-  return {demandTotal,served,failRate,vehHours,dens,spatial,hubShare,topShare,temporal,
-    verdict:v,thresholds:{HI_D,HI_S,HI_T},
-    cf:{coverRate,paxPerTrip,trips,corridorNames,drtPaxPerVehHour,drtLoadRate,drtShareRate,
-      fixedStretch,waitAvgMin,waitMaxMin,dwellSec},
-    compare, distance:{lineKm,fixedDailyKm,drtDailyKm}};
-}
-
-function SuitabilityView({demandRows,vehicles,total,demandSrc,dwell,drtDetail}){
-  const [headway,setHeadway]=React.useState(30);
-  const defK=Math.max(2,Math.ceil((STOPS.length||10)*0.4));
-  const [lineK,setLineK]=React.useState(defK);
-  const activeV=vehicles.filter(v=>v.active);
-  const vehHours=activeV.reduce((s,v)=>s+(v.end-v.start),0)/3600;
-  const opHours=activeV.reduce((mx,v)=>Math.max(mx,(v.end-v.start)/3600),0)||8;
-  if(!demandRows||demandRows.length===0)
-    return (
-    <div style={{marginTop:16,fontSize:11.5,color:"#8A8474",background:"#fff",
-      border:"1px dashed #D8D3C6",borderRadius:10,padding:"10px 12px"}}>
-      運行方式の適性判定：判定に使う需要がない。予約を確定するか需要を流し込むと表示される。
-    </div>);
-  const J=judgeModality(demandRows,total,{vehHours,opHours,headwayMin:headway,lineStopN:lineK,dwell,drtDetail});
-  const pc=x=>`${Math.round(x*100)}%`;
-  const vc = J.verdict.key==="fixed"?{bg:"#EAF0F7",bd:"#C4D3E6",fg:"#2C4A6E",mk:"定時向き"}
-           : J.verdict.key==="semi" ?{bg:"#F3EEF7",bd:"#D8C9E4",fg:"#5B3F73",mk:"中間"}
-           :                         {bg:"#EAF3EC",bd:"#C4DFC9",fg:"#2C6E3C",mk:"DRT向き"};
-  const meter=(label,val,scale,hi,unitTxt)=>{
-    const w=Math.max(0,Math.min(100,val/scale*100));
-    const hiPos=Math.max(0,Math.min(100,hi/scale*100));
-    const isHi=val>=hi;
-    return (
-    <div style={{marginBottom:8}}>
-      <div style={{display:"flex",fontSize:11,marginBottom:3,alignItems:"baseline"}}>
-        <span style={{color:"#3A3526",fontWeight:700}}>{label}</span>
-        <span style={{marginLeft:"auto",fontFamily:"'SF Mono','Consolas',monospace",color:"#3A3526"}}>{unitTxt}</span>
-        <span style={{marginLeft:8,fontSize:10,fontWeight:700,color:isHi?"#2C4A6E":"#8A8474",width:20,textAlign:"right"}}>{isHi?"高":"低"}</span>
-      </div>
-      <div style={{height:10,background:"#EDEAE0",borderRadius:5,overflow:"hidden",position:"relative"}}>
-        <div style={{width:`${w}%`,height:"100%",background:isHi?"#5B7DA8":"#B7AE9B"}}/>
-        <div style={{position:"absolute",left:`${hiPos}%`,top:-1,bottom:-1,width:1.5,background:"#9B3B2B"}} title="判定しきい値"/>
-      </div>
-    </div>);
-  };
-  const inS={width:52,padding:"3px 5px",border:"1px solid #C9C4B8",borderRadius:5,fontSize:12,
-    fontFamily:"'SF Mono','Consolas',monospace",textAlign:"right"};
-  return (
-  <div style={{marginTop:16,border:`1px solid ${vc.bd}`,borderRadius:10,overflow:"hidden"}}>
-    <div style={{background:"#14202F",color:"#E8E4DA",fontSize:12,fontWeight:700,padding:"7px 12px",letterSpacing:1}}>
-      運行方式の適性判定
-      <span style={{fontWeight:400,fontSize:10.5,color:"#9AA7BA",marginLeft:8}}>そもそもDRTが適正か／定時定路線が向くか（この需要パターン下での試算）</span>
-    </div>
-    <div style={{background:"#fff",padding:"12px 14px"}}>
-
-      <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}>
-        <span style={{fontSize:10.5,fontWeight:700,color:vc.fg,background:vc.bg,border:`1px solid ${vc.bd}`,borderRadius:5,padding:"2px 8px"}}>判定・{vc.mk}</span>
-        <span style={{fontSize:14,fontWeight:700,color:"#22303F"}}>{J.verdict.label}</span>
-      </div>
-      <div style={{fontSize:12.5,color:"#3A424C",lineHeight:1.6,marginBottom:8}}>{J.verdict.reason}</div>
-      <div style={{fontSize:12.5,color:"#22303F",lineHeight:1.6,background:vc.bg,borderLeft:`3px solid ${vc.fg}`,padding:"7px 10px",borderRadius:"0 6px 6px 0"}}>
-        <span style={{fontWeight:700}}>打ち手：</span>{J.verdict.action}
-      </div>
-      {J.verdict.tempNote&&<div style={{fontSize:11,color:"#8A8474",marginTop:7}}>補足：{J.verdict.tempNote}</div>}
-
-      <div style={{marginTop:14,marginBottom:6,fontSize:11.5,fontWeight:700,color:"#3A3526"}}>需要構造の3軸<span style={{fontWeight:400,fontSize:10,color:"#9B3B2B",marginLeft:8}}>赤線＝定時寄り判定のしきい値</span></div>
-      {meter("需要密度（件/台時）",J.dens,6,J.thresholds.HI_D,`${J.dens.toFixed(1)} 件/台時`)}
-      {meter("空間集中度（コリドー・拠点集中）",J.spatial,1,J.thresholds.HI_S,pc(J.spatial))}
-      {meter("時間集中度（ピーク1時間シェア）",J.temporal,1,J.thresholds.HI_T,pc(J.temporal))}
-
-      <div style={{marginTop:16,marginBottom:6,fontSize:11.5,fontWeight:700,color:"#3A3526"}}>
-        現DRT実績 vs 定時路線の試算
-      </div>
-      <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
-        <div style={{flex:"1 1 240px",border:"1px solid #C4DFC9",borderRadius:8,overflow:"hidden"}}>
-          <div style={{background:"#EAF3EC",color:"#2C6E3C",fontSize:11,fontWeight:700,padding:"5px 10px"}}>現DRT（実績）</div>
-          <div style={{padding:"8px 10px",fontSize:12,lineHeight:1.9,color:"#3A3526"}}>
-            台時あたり乗客：<b>{J.cf.drtPaxPerVehHour.toFixed(1)}人/台時</b><br/>
-            実車率：<b>{pc(J.cf.drtLoadRate)}</b>／乗合率：<b>{pc(J.cf.drtShareRate)}</b><br/>
-            捌いた需要：<b>{J.served}/{J.demandTotal}件</b>（不成立{pc(J.failRate)}）
-          </div>
-        </div>
-        <div style={{flex:"1 1 240px",border:"1px solid #C4D3E6",borderRadius:8,overflow:"hidden"}}>
-          <div style={{background:"#EAF0F7",color:"#2C4A6E",fontSize:11,fontWeight:700,padding:"5px 10px"}}>定時路線（試算）</div>
-          <div style={{padding:"8px 10px",fontSize:12,lineHeight:1.9,color:"#3A3526"}}>
-            <span style={{fontSize:10.5,color:"#5B7DA8",fontWeight:700}}>輸送量</span><br/>
-            この路線がカバーする需要：<b>{pc(J.cf.coverRate)}</b><br/>
-            便あたり平均乗客：<b>{J.cf.paxPerTrip.toFixed(1)}人/便</b>（{J.cf.trips}便/日・往復）<br/>
-            <span style={{fontSize:10.5,color:"#9B3B2B",fontWeight:700}}>サービスコスト（利用者の負担）</span><br/>
-            平均待ち時間：<b>{J.cf.waitAvgMin.toFixed(0)}分</b>（最大{J.cf.waitMaxMin.toFixed(0)}分）※便間隔を広げた分だけ増える<br/>
-            乗車時間の伸び：<b>{J.cf.fixedStretch.toFixed(2)}倍</b>（直行比）※経由する停留所が増えるほど伸びる<br/>
-            路線：<b>{J.cf.corridorNames||"—"}</b>
-          </div>
-        </div>
-      </div>
-      <div style={{fontSize:10.5,color:"#6B6453",marginTop:8,lineHeight:1.7}}>
-        読み筋：輸送量とサービスコストはトレードオフの関係にある。便間隔を広げれば「便あたり乗客」は上がるが、それは便を減らした結果で待ち時間が延びただけであり、効率化ではない。路線の停留所数を増やせばカバー率は上がるが、経由地が増える分だけ乗車時間の伸びも大きくなる。判断は輸送量の数字だけでなく、待ち時間・乗車時間の伸びと合わせて見る必要がある。カバー率が低い→需要が路線に乗らず取りこぼす（DRT向きのサイン）。
-      </div>
-
-      {/* 個別比較：確定予約（実績あり）のみを対象。母集団が上の判定（不成立込み全需要）と異なる点に注意 */}
-      <div style={{marginTop:16,marginBottom:6,fontSize:11.5,fontWeight:700,color:"#3A3526"}}>
-        現DRT利用者 個別比較（確定予約ベース）
-        <span style={{fontWeight:400,fontSize:10,color:"#9B3B2B",marginLeft:8}}>母集団が上の判定と異なる：ここは実際に運んだ確定予約のみが対象</span>
-      </div>
-      {!J.compare
-        ?<div style={{fontSize:11.5,color:"#8A8474",background:"#F6F3EC",borderRadius:8,padding:"8px 10px"}}>
-          確定予約の中に、この路線でカバーされる人がいない。予約を確定するか、路線の停留所数を増やすと表示される。
-        </div>
-        :<>
-        <div style={{fontSize:12,color:"#4A4636",marginBottom:8}}>
-          現在の確定予約 {J.compare.drtTotalN}件のうち、この路線でカバーされるのは <b>{J.compare.n}件・{J.compare.paxN}人</b>。
-        </div>
-        <div style={{overflow:"auto"}}>
-        <table style={{borderCollapse:"collapse",width:"100%",fontSize:12}}>
-          <thead><tr style={{background:"#F0EDE4"}}>
-            <th style={{padding:"5px 10px",textAlign:"left",borderBottom:"2px solid #1E2A38",fontSize:11}}>項目</th>
-            <th style={{padding:"5px 10px",textAlign:"right",borderBottom:"2px solid #1E2A38",fontSize:11,color:"#2C6E3C"}}>現DRT実績</th>
-            <th style={{padding:"5px 10px",textAlign:"right",borderBottom:"2px solid #1E2A38",fontSize:11,color:"#2C4A6E"}}>定時路線試算</th>
-          </tr></thead>
-          <tbody>
-            <tr>
-              <td style={{padding:"4px 10px",borderBottom:"1px solid #EBE7DC"}}>乗車時間（平均）</td>
-              <td style={{padding:"4px 10px",textAlign:"right",borderBottom:"1px solid #EBE7DC",fontFamily:"monospace"}}>{J.compare.drtRideAvgMin.toFixed(1)}分</td>
-              <td style={{padding:"4px 10px",textAlign:"right",borderBottom:"1px solid #EBE7DC",fontFamily:"monospace"}}>{J.compare.fxRideAvgMin.toFixed(1)}分</td>
-            </tr>
-            <tr>
-              <td style={{padding:"4px 10px",borderBottom:"1px solid #EBE7DC"}}>希望とのズレ／待ち時間（平均）</td>
-              <td style={{padding:"4px 10px",textAlign:"right",borderBottom:"1px solid #EBE7DC",fontFamily:"monospace"}}>{J.compare.drtDevAvgMin.toFixed(1)}分</td>
-              <td style={{padding:"4px 10px",textAlign:"right",borderBottom:"1px solid #EBE7DC",fontFamily:"monospace"}}>{J.compare.fxWaitAvgMin.toFixed(1)}分（最大{J.compare.fxWaitMaxMin.toFixed(0)}分）</td>
-            </tr>
-          </tbody>
-        </table>
-        </div>
-        <div style={{fontSize:10.5,color:"#8A8474",marginTop:6,lineHeight:1.6}}>
-          「希望とのズレ／待ち時間」はDRT・定時で性質が異なる指標を並べている。DRT側は乗車位置まで迎えに来る約束時刻と希望の差、定時側は停留所で便を待つ物理的な待ち時間（便間隔÷2の期待値）。数字の大小だけでなく体験の質の違いも踏まえて読む必要がある。
-        </div>
-      </>}
-
-      {/* 車両側の走行距離比較（システム全体のコスト。母集団が異なる点に注意） */}
-      <div style={{marginTop:16,marginBottom:6,fontSize:11.5,fontWeight:700,color:"#3A3526"}}>
-        車両側の走行距離（1日あたり）
-      </div>
-      <div style={{display:"flex",gap:10,flexWrap:"wrap",fontSize:12,color:"#3A3526"}}>
-        <div style={{flex:"1 1 200px",background:"#EAF3EC",borderRadius:8,padding:"8px 10px"}}>
-          現DRT（全稼働・回送含む）：<b>{J.distance.drtDailyKm.toFixed(1)}km</b>
-        </div>
-        <div style={{flex:"1 1 200px",background:"#EAF0F7",borderRadius:8,padding:"8px 10px"}}>
-          定時路線（往復×{J.cf.trips}便・需要に関わらず固定）：<b>{J.distance.fixedDailyKm.toFixed(1)}km</b>
-        </div>
-      </div>
-      <div style={{fontSize:10.5,color:"#8A8474",marginTop:6,lineHeight:1.6}}>
-        DRT側は現在の全需要（この路線対象外の予約も含む）を運ぶための総走行距離。定時側はこの候補路線を毎日往復運行するのに必要な距離で、乗客がいてもいなくても発生する固定コスト。母集団が異なるため単純な優劣比較ではなく、「DRTは需要に応じて伸縮する変動コスト」「定時は需要に関わらない固定コスト」という性質の違いとして読む。
-      </div>
-
-      <div style={{marginTop:14,display:"flex",gap:14,alignItems:"center",flexWrap:"wrap",
-        background:"#F6F3EC",borderRadius:8,padding:"8px 10px"}}>
-        <span style={{fontSize:11,fontWeight:700,color:"#3A3526"}}>試算の前提</span>
-        <label style={{fontSize:11,color:"#4A4636"}}>便間隔
-          <input type="number" min={5} max={120} step={5} value={headway}
-            onChange={e=>setHeadway(Math.max(5,Math.min(120,Number(e.target.value)||30)))} style={{...inS,marginLeft:5}}/>分</label>
-        <label style={{fontSize:11,color:"#4A4636"}}>路線が停まる停留所数
-          <input type="number" min={2} max={STOPS.length} step={1} value={lineK}
-            onChange={e=>setLineK(Math.max(2,Math.min(STOPS.length,Number(e.target.value)||defK)))} style={{...inS,marginLeft:5}}/>停</label>
-      </div>
-      <div style={{fontSize:10.5,color:"#8A8474",marginTop:8,lineHeight:1.7}}>
-        前提：判定は「{demandSrc}」の需要{J.demandTotal}件に基づく（不成立を含む）。定時路線は需要上位のODから機械的に引いた仮想路線で、人手で選んでいない。稼働{J.vehHours.toFixed(1)}台時・運行{opHours.toFixed(1)}時間帯・便間隔{headway}分での試算。1シナリオの試算であり地域全体の結論ではない。しきい値（密度{J.thresholds.HI_D}・集中{pc(J.thresholds.HI_S)}・時間{pc(J.thresholds.HI_T)}）は仮置きで現場の実態に合わせ調整が要る。
-      </div>
-    </div>
-  </div>);
-}
-
 function AnalysisTab({vehicles,sims,resMap,P,lastDemand}){
   const {per,total}=analyzeOps(vehicles,sims,resMap,P);
-  // セミ整合性チェック：mode=semiなのに実際のルートにアンカーが無い車両を検出。
-  // 予約全消去やネットワーク再読込の後など、routesだけ空になった「見かけフル」状態を炙り出す。
-  const semiBroken=vehicles.filter(v=>v.active&&v.mode==="semi"
-    &&(!sims[v.id]||!sims[v.id].events||sims[v.id].events.every(e=>e.type!=="ANCHOR")));
   const advice=buildAdvice(total,P,lastDemand);
   const diag=diagnoseBottleneck(total);
   const avgLr=total.span>0?total.loadedTime/total.span:0;
@@ -3875,16 +2956,6 @@ function AnalysisTab({vehicles,sims,resMap,P,lastDemand}){
     <div style={{fontSize:12,color:"#6B6453",marginBottom:10}}>
       現在の確定予約に基づく運行の分析。稼働 {total.n}台・予約 {total.resCount}件・延べ {total.paxCarried}人。
     </div>
-    {semiBroken.length>0&&(
-      <div style={{background:"#F8E7E3",border:"1px solid #E5C3B9",borderRadius:8,
-        padding:"9px 12px",marginBottom:10,fontSize:12,color:"#9B3B2B",lineHeight:1.6}}>
-        <b>注意：{semiBroken.map(v=>v.name).join("・")} はセミ設定だが背骨（アンカー）が運行に反映されていない。</b>
-        フルデマンドとして集計されている。予約全消去やネットワーク再読込の後は背骨だけが残り
-        ルートが空になっている可能性がある。コリドーパネルまたは車両設定から背骨を再適用し、
-        その後で需要を自動確定すること。
-      </div>
-    )}
-
     {/* ボトルネック診断：効率が上がらない主因を1つに絞る */}
     <div style={{marginBottom:14,border:`1px solid ${dc.bd}`,borderRadius:10,overflow:"hidden"}}>
       <div style={{background:"#14202F",color:"#E8E4DA",fontSize:12,fontWeight:700,padding:"7px 12px",letterSpacing:1}}>
@@ -4020,9 +3091,6 @@ function AnalysisTab({vehicles,sims,resMap,P,lastDemand}){
       乗合率が低い→時間的に需要が重なっていないか、San（ズレ幅）が狭く相乗りの機会を逃している。
       寄り道消費率が高いのに乗合率も高い→エンジンは許容範囲を使い切って効率化しており、これ以上は利用者体験とのトレードオフ。
     </div>
-
-    {/* 運行方式の適性判定（DRT／セミ／定時） */}
-    <SuitabilityView demandRows={demandRows} vehicles={vehicles} total={total} demandSrc={demandSrc} dwell={P.dwell} drtDetail={drtDetail}/>
 
     {/* 流し込み需要の記録（生成設定＋不成立を含む一覧） */}
     <DemandRecord lastDemand={lastDemand} vehicles={vehicles}/>
